@@ -82,14 +82,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "- 每次上传的原始点、现役事件、变更记录在同一个 SQLite 写事务中提交。\n\n"
             "**在 /docs 演示迟到补点与撤回**：展开 `POST /demo/run`，点击 "
             "Try it out -> Execute。响应内含修改前后事件、retract/upsert 变更"
-            "及保留编号的事件，可直接观察。"
+            "及保留编号的事件，可直接观察。\n\n"
+            "**在 /docs 演示按批次撤销**：展开 `POST /demo/revoke`。基线批次中"
+            "被另一批次重传过的点会在撤销后保留，其余点删除、事件重算，"
+            "并展示重复撤销与已撤销批次重投的行为。"
         ),
         openapi_tags=[
             {"name": "ports", "description": "港区矩形范围登记"},
-            {"name": "uploads", "description": "CSV 点位上传（原子、幂等）"},
+            {"name": "uploads", "description": "CSV 点位上传（原子、幂等）与按批次撤销"},
             {"name": "events", "description": "当前现役靠港停留事件"},
             {"name": "changes", "description": "按游标顺序读取的事件变更流"},
-            {"name": "demo", "description": "迟到补点与撤回演示"},
+            {"name": "demo", "description": "迟到补点与按批次撤销演示"},
             {"name": "system", "description": "健康检查"},
         ],
     )
@@ -233,6 +236,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "`Idempotency-Key` 可选；未提供时按内容 SHA-256 生成。"
             "同一 key 与同一内容重复上传返回原批次结果（replayed=true），"
             "不会重复写入点位或追发变更；同一 key 不同内容返回 409。"
+            "若原批次已被撤销，重投返回 `revoked=true`，不会复活该批次。"
         ),
         responses={
             200: {"description": "重复上传，返回原批次结果"},
@@ -285,6 +289,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             status_code=200 if replayed else 201,
             content={"replayed": replayed, **result},
+        )
+
+    @app.post(
+        "/ports/{port_code}/uploads/{batch_id}/revoke",
+        tags=["uploads"],
+        summary="按 batch_id 撤销一次上传（原子、幂等）",
+        description=(
+            "撤销指定批次对观测的来源声明：只有**没有其他有效来源**的点会被"
+            "删除，被其他批次重传过的同船同刻同坐标观测保留。随后仅对受影响"
+            "船舶按剩余点重算停留事件：未变事件保留编号，变化事件按原游标"
+            "续发 retract + upsert。\n\n"
+            "缺少完整逐点来源记录的既有批次（升级前写入）拒绝撤销，返回 409 "
+            "`batch_provenance_incomplete`。重复撤销返回同一撤销结果"
+            "（replayed=true），不产生新变更。撤销后以相同 `Idempotency-Key` "
+            "重投该批次会返回 `revoked=true`，不会复活。"
+        ),
+        responses={
+            200: {"description": "批次此前已撤销，返回原撤销结果"},
+            409: {"description": "批次缺少完整来源记录，不能安全撤销"},
+            404: {"description": "批次不属于该港区或不存在"},
+        },
+    )
+    def revoke_upload(port_code: str, batch_id: int, conn: Db) -> JSONResponse:
+        result, replayed = service.revoke_batch(
+            conn, port_code=port_code, batch_id=batch_id
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"replayed": replayed, "status": "revoked", **result},
         )
 
     @app.get(
@@ -367,6 +400,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # reads, so a demo either fully succeeds or leaves nothing behind.
             with db.write_transaction(conn):
                 return _run_demo(conn)
+
+        @app.post(
+            "/demo/revoke",
+            tags=["demo"],
+            summary="演示按批次撤销与重传来源保护（可直接在 /docs 执行）",
+            description=(
+                "每次执行创建一个独立演示港区：上传基线批次后，再用第二个批次"
+                "重传其中两艘船的点位（同船同刻同坐标）。撤销基线批次时，"
+                "仅被重传来源覆盖的点保留，只有基线来源的点被删除；受影响事件"
+                "按剩余点重算，未变化事件保留编号，变化事件 retract + upsert。"
+                "响应同时展示重复撤销（无新变更）与已撤销批次同键重投"
+                "（返回 revoked，不复活）。"
+            ),
+        )
+        def run_revoke_demo(conn: Db) -> dict:
+            with db.write_transaction(conn):
+                return _run_revoke_demo(conn)
 
     return app
 
@@ -497,6 +547,151 @@ def _run_demo(conn: sqlite3.Connection) -> dict:
             "retracted_event_ids": retracted,
             "added_event_ids": added,
             "unchanged_retained_event_ids": unchanged,
+        },
+    }
+
+
+def _run_revoke_demo(conn: sqlite3.Connection) -> dict:
+    port_code = "REVOKE-" + uuid.uuid4().hex[:8].upper()
+    min_lat, max_lat, min_lon, max_lon = PortIn(
+        code=port_code, name="撤销演示港区", **DEMO_PORT_BOUNDS
+    ).e6_bounds()
+    service.register_port(
+        conn,
+        code=port_code,
+        name="撤销演示港区",
+        min_lat_e6=min_lat,
+        max_lat_e6=max_lat,
+        min_lon_e6=min_lon,
+        max_lon_e6=max_lon,
+    )
+
+    base_rows = [
+        # SHIP-01 event A (00:00-00:30) and event B (01:00-01:30).
+        ("SHIP-01", "2026-01-01T00:00:00Z", 31.20, 121.50),
+        ("SHIP-01", "2026-01-01T00:10:00Z", 31.201, 121.501),
+        ("SHIP-01", "2026-01-01T00:20:00Z", 31.202, 121.502),
+        ("SHIP-01", "2026-01-01T00:30:00Z", 31.203, 121.503),
+        ("SHIP-01", "2026-01-01T01:00:00Z", 31.204, 121.504),
+        ("SHIP-01", "2026-01-01T01:10:00Z", 31.205, 121.505),
+        ("SHIP-01", "2026-01-01T01:20:00Z", 31.206, 121.506),
+        ("SHIP-01", "2026-01-01T01:30:00Z", 31.207, 121.507),
+        # SHIP-02 event C (00:00-00:30), only sourced by the baseline.
+        ("SHIP-02", "2026-01-01T00:00:00Z", 31.30, 121.60),
+        ("SHIP-02", "2026-01-01T00:10:00Z", 31.301, 121.601),
+        ("SHIP-02", "2026-01-01T00:20:00Z", 31.302, 121.602),
+        ("SHIP-02", "2026-01-01T00:30:00Z", 31.303, 121.603),
+        # SHIP-03 event D (00:00-00:30), later fully retransmitted.
+        ("SHIP-03", "2026-01-01T00:00:00Z", 31.31, 121.61),
+        ("SHIP-03", "2026-01-01T00:10:00Z", 31.311, 121.611),
+        ("SHIP-03", "2026-01-01T00:20:00Z", 31.312, 121.612),
+        ("SHIP-03", "2026-01-01T00:30:00Z", 31.313, 121.613),
+    ]
+    # A retransmission of SHIP-03's event D only.  Its points are duplicates
+    # as far as the observation store is concerned, but they acquire a second
+    # live source, so revoking the baseline must keep them.
+    retransmit_rows = [
+        ("SHIP-03", "2026-01-01T00:00:00Z", 31.31, 121.61),
+        ("SHIP-03", "2026-01-01T00:10:00Z", 31.311, 121.611),
+        ("SHIP-03", "2026-01-01T00:20:00Z", 31.312, 121.612),
+        ("SHIP-03", "2026-01-01T00:30:00Z", 31.313, 121.613),
+    ]
+
+    base_csv = _demo_csv(base_rows)
+    retransmit_csv = _demo_csv(retransmit_rows)
+    base_batch, _ = service.ingest(
+        conn,
+        port_code=port_code,
+        upload_key="demo-revoke-base",
+        content=base_csv,
+        rows=csv_ingest.parse_upload(base_csv, max_rows=1000).rows,
+    )
+    replay_batch, _ = service.ingest(
+        conn,
+        port_code=port_code,
+        upload_key="demo-revoke-retransmit",
+        content=retransmit_csv,
+        rows=csv_ingest.parse_upload(retransmit_csv, max_rows=1000).rows,
+    )
+    before, _ = service.list_events(conn, port_code=port_code)
+    cursor_before = service.latest_cursor(conn, port_code=port_code)
+
+    revoke, _ = service.revoke_batch(
+        conn, port_code=port_code, batch_id=base_batch["batch_id"]
+    )
+    change_page = service.list_changes(
+        conn, port_code=port_code, after=cursor_before, limit=1000
+    )
+    after, _ = service.list_events(conn, port_code=port_code)
+    cursor_after_revoke = service.latest_cursor(conn, port_code=port_code)
+
+    repeat, repeated = service.revoke_batch(
+        conn, port_code=port_code, batch_id=base_batch["batch_id"]
+    )
+    # Re-posting the revoked batch's key must not revive it.
+    revived_replay, _ = service.ingest(
+        conn,
+        port_code=port_code,
+        upload_key="demo-revoke-base",
+        content=base_csv,
+        rows=csv_ingest.parse_upload(base_csv, max_rows=1000).rows,
+    )
+
+    before_by_vessel = {e["vessel_id"]: e for e in before}
+    after_by_vessel = {e["vessel_id"]: e for e in after}
+    unchanged = sorted(
+        vessel
+        for vessel, event in before_by_vessel.items()
+        if vessel in after_by_vessel
+        and after_by_vessel[vessel]["event_id"] == event["event_id"]
+    )
+    retracted = [
+        c["event_id"] for c in change_page["changes"] if c["type"] == "retract"
+    ]
+    added = [
+        c["event_id"] for c in change_page["changes"] if c["type"] == "upsert"
+    ]
+
+    return {
+        "demo_port": port_code,
+        "narrative": [
+            "1. 基线上传形成 SHIP-01 两个事件、SHIP-02 一个事件、"
+            "SHIP-03 一个事件。",
+            "2. 第二个批次以同船同刻同坐标重传 SHIP-03 的点，为该批观测增加"
+            "一个有效来源。",
+            "3. 撤销基线批次：SHIP-01、SHIP-02 只有基线来源，其点被删除、"
+            "事件被 retract；SHIP-03 的点仍有重传批次来源，保留且事件编号不变。",
+            "4. 重复撤销返回同一结果且不产生新变更；以基线批次原幂等键重投"
+            "返回 revoked=true，不复活已撤销批次。",
+        ],
+        "baseline_csv": base_csv.decode("utf-8"),
+        "retransmit_csv": retransmit_csv.decode("utf-8"),
+        "baseline": {
+            "batch": base_batch,
+            "retransmit_batch": replay_batch,
+            "cursor_before_revoke": cursor_before,
+            "events": before,
+        },
+        "revocation": {
+            "result": revoke,
+            "changes_after_cursor": change_page,
+        },
+        "final_events": after,
+        "repeat_revocation": {"replayed": repeated, "result": repeat},
+        "replay_after_revocation": {
+            "replayed": True,
+            "revoked": revived_replay["revoked"],
+            "batch_id": revived_replay["batch_id"],
+            "cursor_unchanged": (
+                service.latest_cursor(conn, port_code=port_code)
+                == cursor_after_revoke
+            ),
+        },
+        "summary": {
+            "retracted_event_ids": retracted,
+            "added_event_ids": added,
+            "unchanged_retained_vessels": unchanged,
+            "retained_retransmitted_vessel": "SHIP-03",
         },
     }
 

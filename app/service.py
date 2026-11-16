@@ -1,16 +1,25 @@
-"""Ingest, event reconciliation and cursor-based change feed.
+"""Ingest, revocation, event reconciliation and cursor-based change feed.
 
 Consistency contract
 --------------------
-* Every upload is applied in exactly one SQLite ``BEGIN IMMEDIATE``
-  transaction.  Raw points, current events and change-log entries therefore
-  become visible together; a failure rolls all of them back and the change
-  cursor does not advance.
+* Every upload *and every revocation* is applied in exactly one SQLite
+  ``BEGIN IMMEDIATE`` transaction.  Source records, raw points, current events
+  and change-log entries therefore become visible together; a failure rolls all
+  of them back and the change cursor does not advance.
 * ``BEGIN IMMEDIATE`` serialises writers across processes/instances sharing the
-  database file, so two interleaved uploads cannot lose updates.
+  database file, so interleaved uploads/revocations cannot lose updates.
 * ``(port_id, upload_key)`` is unique and is checked inside the write
   transaction.  A replayed upload returns the original result and emits no new
-  changes.  The same ``upload_key`` with different content is rejected.
+  changes.  The same ``upload_key`` with different content is rejected, and a
+  replayed upload of a revoked batch reports the revocation instead of reviving
+  it.
+* Each observation records which batches sourced it (``point_sources``).
+  Revoking a batch removes only points with no other live source; a shared
+  point survives while any non-revoked batch still asserts it.
+* Batches carry ``provenance_version``.  Only batches written with per-point
+  provenance (current schema) may be revoked; older batches are refused because
+  removing points without provenance could delete observations retransmitted by
+  another batch.
 * The change feed uses a monotonically increasing ``seq`` primary key as the
   cursor, so clients can page strictly forward and resume after restarts.
 """
@@ -28,6 +37,11 @@ from . import events as event_rules
 from .csv_ingest import RawPointRow
 from .db import write_transaction
 from .errors import AppError
+
+#: Batches written by this code store one ``point_sources`` row per
+#: observation they asserted.  Anything older has no complete provenance and
+#: is not revocable.
+PROVENANCE_VERSION = 1
 
 
 def utc_now_iso() -> str:
@@ -151,16 +165,22 @@ def _batch_response(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
     row = conn.execute(
         "SELECT * FROM ingest_batches WHERE id = ?", (batch_id,)
     ).fetchone()
+    # Only the upload's own effects; changes emitted by a later revocation use
+    # operation='revoke' and are reported through the revocation response.
     change_rows = conn.execute(
-        "SELECT change_type, event_id FROM event_changes WHERE batch_id = ? "
-        "ORDER BY seq",
+        "SELECT change_type, event_id FROM event_changes "
+        "WHERE batch_id = ? AND operation = 'ingest' ORDER BY seq",
         (batch_id,),
     ).fetchall()
     first = conn.execute(
-        "SELECT MIN(seq) AS s FROM event_changes WHERE batch_id = ?", (batch_id,)
+        "SELECT MIN(seq) AS s FROM event_changes "
+        "WHERE batch_id = ? AND operation = 'ingest'",
+        (batch_id,),
     ).fetchone()["s"]
     last = conn.execute(
-        "SELECT MAX(seq) AS s FROM event_changes WHERE batch_id = ?", (batch_id,)
+        "SELECT MAX(seq) AS s FROM event_changes "
+        "WHERE batch_id = ? AND operation = 'ingest'",
+        (batch_id,),
     ).fetchone()["s"]
     return {
         "batch_id": row["id"],
@@ -172,6 +192,9 @@ def _batch_response(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any]:
         "rows_new": row["rows_new"],
         "rows_duplicate": row["rows_duplicate"],
         "rows_outside_port": row["rows_outside_port"],
+        "revocable": row["provenance_version"] >= PROVENANCE_VERSION,
+        "revoked": row["revoked_at"] is not None,
+        "revoked_at": row["revoked_at"],
         "event_changes": {
             "upserted": sum(1 for c in change_rows if c["change_type"] == "upsert"),
             "retracted": sum(
@@ -245,17 +268,19 @@ def _append_change(
     event_id: int,
     stay: event_rules.Stay,
     created_at: str,
+    operation: str = "ingest",
 ) -> None:
     conn.execute(
         """
         INSERT INTO event_changes
-            (batch_id, port_id, change_type, event_id, vessel_id, start_time,
-             end_time, start_lat_e6, start_lon_e6, end_lat_e6, end_lon_e6,
-             point_count, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (batch_id, operation, port_id, change_type, event_id, vessel_id,
+             start_time, end_time, start_lat_e6, start_lon_e6, end_lat_e6,
+             end_lon_e6, point_count, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             batch_id,
+            operation,
             port_id,
             change_type,
             event_id,
@@ -279,6 +304,7 @@ def _retract_row(
     port_id: int,
     event: sqlite3.Row,
     created_at: str,
+    operation: str = "ingest",
 ) -> None:
     stay = event_rules.Stay(
         vessel_id=event["vessel_id"],
@@ -298,6 +324,7 @@ def _retract_row(
         event_id=event["id"],
         stay=stay,
         created_at=created_at,
+        operation=operation,
     )
     conn.execute("DELETE FROM events WHERE id = ?", (event["id"],))
 
@@ -311,6 +338,7 @@ def _reconcile_vessel(
     points: list[event_rules.Point],
     existing: list[sqlite3.Row],
     created_at: str,
+    operation: str = "ingest",
 ) -> None:
     stays = event_rules.derive_stays(points, port.contains)
 
@@ -332,6 +360,7 @@ def _reconcile_vessel(
             port_id=port.id,
             event=row,
             created_at=created_at,
+            operation=operation,
         )
 
     # 2. Insert genuinely new events.  An event whose start moved arrived here
@@ -370,6 +399,35 @@ def _reconcile_vessel(
             event_id=cursor.lastrowid,
             stay=stay,
             created_at=created_at,
+            operation=operation,
+        )
+
+
+def _recompute_vessels(
+    conn: sqlite3.Connection,
+    *,
+    batch_id: int,
+    port: Port,
+    vessel_ids: Iterable[str],
+    created_at: str,
+    operation: str = "ingest",
+) -> None:
+    """Re-derive events for the named vessels from their stored points."""
+    ordered = sorted(set(vessel_ids))
+    if not ordered:
+        return
+    points = _load_points_for_vessels(conn, port.id, ordered)
+    existing_events = _existing_events(conn, port.id, ordered)
+    for vessel_id in ordered:
+        _reconcile_vessel(
+            conn,
+            batch_id=batch_id,
+            port=port,
+            vessel_id=vessel_id,
+            points=points[vessel_id],
+            existing=existing_events[vessel_id],
+            created_at=created_at,
+            operation=operation,
         )
 
 
@@ -403,6 +461,8 @@ def ingest(
                         "different content"
                     ),
                 )
+            # A revoked batch is never revived by replaying its key: report the
+            # original batch together with its revocation state.
             return _batch_response(conn, previous["id"]), True
 
         created_at = utc_now_iso()
@@ -410,12 +470,13 @@ def ingest(
             """
             INSERT INTO ingest_batches
                 (port_id, upload_key, content_sha256, rows_received, rows_new,
-                 rows_duplicate, rows_outside_port, received_at)
-            VALUES (?, ?, ?, ?, 0, 0, 0, ?)
+                 rows_duplicate, rows_outside_port, received_at,
+                 provenance_version)
+            VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?)
             """,
             (port.id, upload_key, content_sha,
              rows_received if rows_received is not None else len(rows),
-             created_at),
+             created_at, PROVENANCE_VERSION),
         )
         batch_id = int(batch_cursor.lastrowid)
 
@@ -455,24 +516,36 @@ def ingest(
                         },
                     )
                 duplicates += 1
-                continue
+                point_id = int(existing["id"])
+            else:
+                point_cursor = conn.execute(
+                    """
+                    INSERT INTO raw_points
+                        (port_id, batch_id, vessel_id, event_time, lat_e6, lon_e6)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        port.id,
+                        batch_id,
+                        row.vessel_id,
+                        row.event_time,
+                        row.lat_e6,
+                        row.lon_e6,
+                    ),
+                )
+                point_id = int(point_cursor.lastrowid)
+                new_by_vessel.add(row.vessel_id)
+                inserted += 1
+            # Provenance is recorded even for a duplicate point: this batch
+            # also asserts that observation, so revoking another source that
+            # first stored it must not delete the point.
             conn.execute(
                 """
-                INSERT INTO raw_points
-                    (port_id, batch_id, vessel_id, event_time, lat_e6, lon_e6)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO point_sources (point_id, batch_id, created_at)
+                VALUES (?, ?, ?)
                 """,
-                (
-                    port.id,
-                    batch_id,
-                    row.vessel_id,
-                    row.event_time,
-                    row.lat_e6,
-                    row.lon_e6,
-                ),
+                (point_id, batch_id, created_at),
             )
-            new_by_vessel.add(row.vessel_id)
-            inserted += 1
 
         conn.execute(
             """
@@ -483,23 +556,170 @@ def ingest(
             (inserted, duplicates, outside, batch_id),
         )
 
-        if new_by_vessel:
-            points = _load_points_for_vessels(conn, port.id, sorted(new_by_vessel))
-            existing_events = _existing_events(
-                conn, port.id, sorted(new_by_vessel)
-            )
-            for vessel_id in sorted(new_by_vessel):
-                _reconcile_vessel(
-                    conn,
-                    batch_id=batch_id,
-                    port=port,
-                    vessel_id=vessel_id,
-                    points=points[vessel_id],
-                    existing=existing_events[vessel_id],
-                    created_at=created_at,
-                )
+        _recompute_vessels(
+            conn,
+            batch_id=batch_id,
+            port=port,
+            vessel_ids=new_by_vessel,
+            created_at=created_at,
+        )
 
         return _batch_response(conn, batch_id), False
+
+
+def revoke_batch(
+    conn: sqlite3.Connection,
+    *,
+    port_code: str,
+    batch_id: int,
+) -> tuple[dict[str, Any], bool]:
+    """Revoke one upload atomically.
+
+    Returns ``(response, replayed)``.  Replaying a revocation returns the
+    original revocation and emits no changes.  Only points with no remaining
+    live source are deleted; events are then recomputed for every affected
+    vessel.  Unchanged events keep their id, changed ones are retracted under
+    the old id and re-inserted under a new id, exactly like a late upload.
+    """
+    with _transaction_if_needed(conn):
+        port = get_port(conn, port_code)
+        batch = conn.execute(
+            "SELECT * FROM ingest_batches WHERE id = ? AND port_id = ?",
+            (batch_id, port.id),
+        ).fetchone()
+        if batch is None:
+            raise AppError(
+                404,
+                "batch_not_found",
+                f"batch {batch_id} does not exist in port {port.code!r}",
+            )
+        if batch["provenance_version"] < PROVENANCE_VERSION:
+            raise AppError(
+                409,
+                "batch_provenance_incomplete",
+                (
+                    f"batch {batch_id} predates per-point provenance and "
+                    "cannot be revoked safely"
+                ),
+                {"batch_id": batch_id},
+            )
+        if batch["revoked_at"] is not None:
+            return _revocation_response(conn, batch), True
+
+        created_at = utc_now_iso()
+        sourced = conn.execute(
+            """
+            SELECT point_id FROM point_sources WHERE batch_id = ?
+            """,
+            (batch_id,),
+        ).fetchall()
+
+        affected_vessels: set[str] = set()
+        removed = 0
+        retained = 0
+        for source in sourced:
+            point = conn.execute(
+                "SELECT * FROM raw_points WHERE id = ?",
+                (source["point_id"],),
+            ).fetchone()
+            if point is None:
+                # Already removed with another batch's shared point; the source
+                # row cascades away, so this is only defensive.
+                continue
+            others = conn.execute(
+                """
+                SELECT 1 FROM point_sources ps
+                JOIN ingest_batches b ON b.id = ps.batch_id
+                WHERE ps.point_id = ? AND ps.batch_id <> ?
+                  AND b.revoked_at IS NULL
+                LIMIT 1
+                """,
+                (point["id"], batch_id),
+            ).fetchone()
+            if others is not None:
+                retained += 1
+                continue
+            # A point inserted by a legacy (pre-provenance) batch has no
+            # explicit source row, but that batch remains an implicit source.
+            # Revoking a newer batch that merely retransmitted it must not
+            # delete an observation the legacy batch still owns.
+            if point["batch_id"] != batch_id:
+                owner = conn.execute(
+                    "SELECT provenance_version, revoked_at FROM ingest_batches "
+                    "WHERE id = ?",
+                    (point["batch_id"],),
+                ).fetchone()
+                if (
+                    owner is not None
+                    and owner["revoked_at"] is None
+                    and owner["provenance_version"] < PROVENANCE_VERSION
+                ):
+                    retained += 1
+                    continue
+            conn.execute("DELETE FROM raw_points WHERE id = ?", (point["id"],))
+            affected_vessels.add(point["vessel_id"])
+            removed += 1
+
+        conn.execute(
+            """
+            UPDATE ingest_batches
+            SET revoked_at = ?, points_removed = ?, points_retained = ?
+            WHERE id = ?
+            """,
+            (created_at, removed, retained, batch_id),
+        )
+
+        _recompute_vessels(
+            conn,
+            batch_id=batch_id,
+            port=port,
+            vessel_ids=affected_vessels,
+            created_at=created_at,
+            operation="revoke",
+        )
+
+        revoked_batch = conn.execute(
+            "SELECT * FROM ingest_batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        return _revocation_response(conn, revoked_batch), False
+
+
+def _revocation_response(
+    conn: sqlite3.Connection,
+    batch: sqlite3.Row,
+) -> dict[str, Any]:
+    revoked_at = batch["revoked_at"]
+    change_rows = conn.execute(
+        "SELECT change_type FROM event_changes "
+        "WHERE batch_id = ? AND operation = 'revoke'",
+        (batch["id"],),
+    ).fetchall()
+    first = conn.execute(
+        "SELECT MIN(seq) AS s FROM event_changes "
+        "WHERE batch_id = ? AND operation = 'revoke'",
+        (batch["id"],),
+    ).fetchone()["s"]
+    last = conn.execute(
+        "SELECT MAX(seq) AS s FROM event_changes "
+        "WHERE batch_id = ? AND operation = 'revoke'",
+        (batch["id"],),
+    ).fetchone()["s"]
+    return {
+        "batch_id": batch["id"],
+        "port_id": batch["port_id"],
+        "upload_key": batch["upload_key"],
+        "revoked": True,
+        "revoked_at": revoked_at,
+        "points_removed": batch["points_removed"],
+        "points_retained": batch["points_retained"],
+        "event_changes": {
+            "upserted": sum(1 for c in change_rows if c["change_type"] == "upsert"),
+            "retracted": sum(
+                1 for c in change_rows if c["change_type"] == "retract"
+            ),
+        },
+        "change_cursor": {"from": first, "to": last},
+    }
 
 
 def list_events(
@@ -571,6 +791,7 @@ def _change_dict(row: sqlite3.Row) -> dict[str, Any]:
     change: dict[str, Any] = {
         "cursor": row["seq"],
         "batch_id": row["batch_id"],
+        "operation": row["operation"],
         "type": row["change_type"],
         "event_id": row["event_id"],
         "vessel_id": row["vessel_id"],

@@ -682,3 +682,503 @@ def test_late_exit_point_splits_an_event(registered: TestClient) -> None:
 
     page = changes(registered, after=cursor_before)
     assert [c["type"] for c in page["changes"]] == ["retract", "upsert", "upsert"]
+
+
+# ---------------------------------------------------------------------------
+# Batch revocation
+# ---------------------------------------------------------------------------
+
+
+def revoke(client: TestClient, batch_id: int, *, port: str = PORT["code"]):
+    return client.post(f"/ports/{port}/uploads/{batch_id}/revoke")
+
+
+def test_revoke_removes_only_points_without_other_source(
+    registered: TestClient,
+) -> None:
+    # Batch A (baseline): SHIP-01 two events and SHIP-02 one event.
+    base = []
+    base += [("SHIP-01", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    base += [("SHIP-01", utc(1, m), *INSIDE) for m in (0, 10, 20, 30)]
+    base += [("SHIP-02", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    first = upload(registered, base, key="revoke-base")
+    assert first.status_code == 201
+    base_id = first.json()["batch_id"]
+    assert first.json()["revocable"] is True
+
+    # Batch B retransmits SHIP-02's exact observations (同船同刻同坐标).
+    retransmit = [("SHIP-02", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    same = upload(registered, retransmit, key="revoke-retransmit")
+    assert same.status_code == 201
+    assert same.json()["rows_new"] == 0
+    assert same.json()["rows_duplicate"] == 4
+
+    before = events(registered)
+    cursor_before = changes(registered)["next_cursor"]
+
+    response = revoke(registered, base_id)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "revoked"
+    assert body["replayed"] is False
+    assert body["revoked"] is True
+    assert body["batch_id"] == base_id
+
+    after = events(registered)
+    # SHIP-02 survives purely on the retransmission's provenance.
+    assert [e["vessel_id"] for e in after] == ["SHIP-02"]
+    before_by_vessel = {e["vessel_id"]: e for e in before}
+    assert after[0]["event_id"] == before_by_vessel["SHIP-02"]["event_id"]
+    assert after[0] == before_by_vessel["SHIP-02"]
+
+    page = changes(registered, after=cursor_before)
+    # Both SHIP-01 events retracted, nothing re-added.
+    assert [c["type"] for c in page["changes"]] == ["retract", "retract"]
+    assert {c["vessel_id"] for c in page["changes"]} == {"SHIP-01"}
+    assert all(c["operation"] == "revoke" for c in page["changes"])
+    assert all(c["batch_id"] == base_id for c in page["changes"])
+
+
+def test_revoke_recomputes_changed_event_and_keeps_unchanged_ids(
+    registered: TestClient,
+) -> None:
+    # One 40 minute event (00:00..00:40, 10 min spacing) for SHIP-01 and an
+    # independent event for SHIP-02 in the same batch.
+    rows = [("SHIP-01", utc(0, m), *INSIDE) for m in (0, 10, 20, 30, 40)]
+    rows += [("SHIP-02", utc(2, m), *INSIDE) for m in (0, 10, 20, 30)]
+    # A second batch extending SHIP-01 with a later point at 00:50.
+    base = upload(registered, rows, key="partial-base")
+    base_id = base.json()["batch_id"]
+    ext = upload(registered, [("SHIP-01", utc(0, 50), *INSIDE)],
+                 key="partial-ext")
+    ext_id = ext.json()["batch_id"]
+
+    before = {e["vessel_id"]: e for e in events(registered)}
+    assert before["SHIP-01"]["duration_seconds"] == 3000  # 00:00..00:50
+    cursor_before = changes(registered)["next_cursor"]
+
+    # Revoking the extension leaves 00:00..00:40: SHIP-01 changes, SHIP-02
+    # is unaffected and must stay absent from the change stream.
+    assert revoke(registered, ext_id).status_code == 200
+    after = {e["vessel_id"]: e for e in events(registered)}
+    assert after["SHIP-01"]["duration_seconds"] == 2400
+    assert after["SHIP-02"] == before["SHIP-02"]
+    kinds = [
+        (c["type"], c["vessel_id"])
+        for c in changes(registered, after=cursor_before)["changes"]
+    ]
+    assert kinds == [("retract", "SHIP-01"), ("upsert", "SHIP-01")]
+
+    # Revoking the baseline now removes every remaining point and therefore
+    # every event.
+    assert revoke(registered, base_id).status_code == 200
+    assert events(registered) == []
+
+
+def test_revoke_is_idempotent_and_emits_no_extra_changes(
+    registered: TestClient,
+) -> None:
+    rows = [("SHIP-A", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    batch_id = upload(registered, rows, key="rev-once").json()["batch_id"]
+
+    first = revoke(registered, batch_id)
+    assert first.status_code == 200 and first.json()["replayed"] is False
+    cursor = changes(registered)["next_cursor"]
+    points = raw_point_count(registered)
+
+    second = revoke(registered, batch_id)
+    assert second.status_code == 200
+    assert second.json()["replayed"] is True
+    assert second.json()["batch_id"] == batch_id
+    assert second.json()["revoked_at"] == first.json()["revoked_at"]
+    assert changes(registered)["next_cursor"] == cursor
+    assert raw_point_count(registered) == points == 0
+    assert events(registered) == []
+
+
+def test_replay_of_revoked_upload_returns_revoked_without_reviving(
+    registered: TestClient,
+) -> None:
+    rows = [("SHIP-A", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    original = upload(registered, rows, key="rev-replay")
+    batch_id = original.json()["batch_id"]
+    assert revoke(registered, batch_id).status_code == 200
+    cursor = changes(registered)["next_cursor"]
+
+    replay = upload(registered, rows, key="rev-replay")
+    assert replay.status_code == 200
+    body = replay.json()
+    assert body["replayed"] is True
+    assert body["revoked"] is True
+    assert body["batch_id"] == batch_id
+    assert body["revoked_at"] is not None
+    # No points resurrected, no events re-created, no cursor movement.
+    assert raw_point_count(registered) == 0
+    assert events(registered) == []
+    assert changes(registered)["next_cursor"] == cursor
+    assert client_batch_count(registered) == 1
+
+
+def test_legacy_batch_without_provenance_refuses_revocation(
+    registered: TestClient,
+) -> None:
+    rows = [("SHIP-A", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    batch_id = upload(registered, rows, key="legacy").json()["batch_id"]
+
+    # Simulate a batch written by schema v1: no per-point provenance rows and
+    # provenance_version = 0.  Revocation must be refused rather than guessing.
+    db_path = registered.app.state.settings.db_path  # type: ignore[attr-defined]
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM point_sources")
+        conn.execute(
+            "UPDATE ingest_batches SET provenance_version = 0 WHERE id = ?",
+            (batch_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cursor = changes(registered)["next_cursor"]
+    response = revoke(registered, batch_id)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "batch_provenance_incomplete"
+    # Nothing changed: points, events and cursor all intact.
+    assert raw_point_count(registered) == 4
+    assert len(events(registered)) == 1
+    assert changes(registered)["next_cursor"] == cursor
+
+
+def test_revoke_unknown_or_foreign_batch_is_404(
+    registered: TestClient,
+) -> None:
+    assert revoke(registered, 999).status_code == 404
+    assert revoke(registered, 999).json()["error"]["code"] == "batch_not_found"
+
+    # A batch in another port must not be revocable through this port.
+    other = registered.post(
+        "/ports",
+        json={**PORT, "code": "OTHER", "min_lat": 30.0, "max_lat": 30.4},
+    )
+    assert other.status_code == 201
+    rows = [("SHIP-A", 0.0 + 1_800_000_000, 31.2, 121.5)]
+    foreign = upload(registered, rows, key="foreign", port="OTHER")
+    assert foreign.status_code == 201
+    foreign_id = foreign.json()["batch_id"]
+    assert revoke(registered, foreign_id).status_code == 404
+    assert revoke(registered, foreign_id, port="NOPE").status_code == 404
+
+
+def test_revoke_rolls_back_atomically_on_failure(
+    registered: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import service as service_module
+
+    rows = [("SHIP-A", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    batch_id = upload(registered, rows, key="rev-crash").json()["batch_id"]
+    baseline_events = events(registered)
+    baseline_points = raw_point_count(registered)
+    baseline_cursor = changes(registered)["next_cursor"]
+
+    original = service_module._recompute_vessels
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash during revoke reconciliation")
+
+    monkeypatch.setattr(service_module, "_recompute_vessels", boom)
+    with pytest.raises(RuntimeError):
+        revoke(registered, batch_id)
+    monkeypatch.setattr(service_module, "_recompute_vessels", original)
+
+    assert raw_point_count(registered) == baseline_points
+    assert events(registered) == baseline_events
+    assert changes(registered)["next_cursor"] == baseline_cursor
+    assert client_batch_count(registered) == 1
+    # The batch is still revocable after the failed attempt.
+    assert revoke(registered, batch_id).status_code == 200
+    assert events(registered) == []
+
+
+def test_interleaved_upload_and_revoke_share_one_consistent_state(
+    tmp_path: Path,
+) -> None:
+    """A retransmission interleaved with a revocation on another connection.
+
+    Whichever writer wins the ``BEGIN IMMEDIATE`` lock, the committed state must
+    be consistent: either the retransmission is recorded (and the shared point
+    survives the revocation) or the revocation commits first.  A point asserted
+    by a live, newly committed batch is never deleted.
+    """
+    path = str(tmp_path / "revoke-race.sqlite3")
+    db.initialise(path)
+    setup = db.connect(path)
+    try:
+        service.register_port(
+            setup,
+            code="P",
+            name="revoke-race",
+            min_lat_e6=31_000_000,
+            max_lat_e6=31_400_000,
+            min_lon_e6=121_200_000,
+            max_lon_e6=121_800_000,
+        )
+        base_rows = [
+            csv_ingest.RawPointRow(i, "SHIP-A", 1_800_000_000 + i * 600,
+                                   31_200_000, 121_500_000)
+            for i in range(4)
+        ]
+        base, _ = service.ingest(
+            setup, port_code="P", upload_key="base", content=b"base",
+            rows=base_rows,
+        )
+    finally:
+        setup.close()
+    base_id = base["batch_id"]
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+    results: dict[str, object] = {}
+
+    def do_revoke() -> None:
+        conn = db.connect(path)
+        try:
+            barrier.wait(timeout=10)
+            results["revoke"] = service.revoke_batch(
+                conn, port_code="P", batch_id=base_id
+            )[0]
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    def do_retransmit() -> None:
+        conn = db.connect(path)
+        try:
+            barrier.wait(timeout=10)
+            rows = [
+                csv_ingest.RawPointRow(i, "SHIP-A", 1_800_000_000 + i * 600,
+                                       31_200_000, 121_500_000)
+                for i in range(4)
+            ]
+            results["retransmit"] = service.ingest(
+                conn, port_code="P", upload_key="retransmit",
+                content=b"retransmit", rows=rows,
+            )[0]
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=do_revoke),
+               threading.Thread(target=do_retransmit)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    conn = db.connect(path)
+    try:
+        points = conn.execute(
+            "SELECT COUNT(*) FROM raw_points WHERE vessel_id='SHIP-A'"
+        ).fetchone()[0]
+        sources = conn.execute("SELECT COUNT(*) FROM point_sources").fetchone()[0]
+        revoked = conn.execute(
+            "SELECT revoked_at FROM ingest_batches WHERE id = ?", (base_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    # The retransmission committed, so every point has two live/dead sources;
+    # the revocation removed only points with no live source left.  No point
+    # is lost and the source ledger matches the observations.
+    assert revoked is not None
+    assert points == 4
+    assert sources >= points
+    conn = db.connect(path)
+    try:
+        found, _ = service.list_events(conn, port_code="P")
+        assert len(found) == 1
+        assert found[0]["point_count"] == 4
+    finally:
+        conn.close()
+
+
+def test_revoke_demo_endpoint(client: TestClient) -> None:
+    response = client.post("/demo/revoke")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    summary = body["summary"]
+    assert summary["retained_retransmitted_vessel"] == "SHIP-03"
+    assert set(summary["unchanged_retained_vessels"]) == {"SHIP-03"}
+    assert len(summary["retracted_event_ids"]) == 3
+    assert len(summary["added_event_ids"]) == 0
+    assert body["repeat_revocation"]["replayed"] is True
+    assert body["replay_after_revocation"]["revoked"] is True
+    assert body["replay_after_revocation"]["cursor_unchanged"] is True
+    final_vessels = {e["vessel_id"] for e in body["final_events"]}
+    assert final_vessels == {"SHIP-03"}
+    # Reusable: a second run creates an isolated demo port.
+    assert client.post("/demo/revoke").status_code == 200
+
+
+def test_revoked_batch_response_reports_its_own_ingest_changes_only(
+    registered: TestClient,
+) -> None:
+    rows = [("SHIP-A", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    batch_id = upload(registered, rows, key="own-effects").json()["batch_id"]
+    revoke(registered, batch_id)
+    # Replaying the revoked batch must still show the original ingest effect,
+    # not the revocation's retraction, and must stay revoked.
+    replay = upload(registered, rows, key="own-effects").json()
+    assert replay["revoked"] is True
+    assert replay["event_changes"] == {"upserted": 1, "retracted": 0}
+    page = changes(registered)
+    assert any(c["operation"] == "revoke" for c in page["changes"])
+
+
+def test_revoking_new_batch_keeps_point_owned_by_legacy_batch(
+    registered: TestClient,
+) -> None:
+    """A legacy batch's point must not be deleted when a newer retransmission
+    batch is revoked."""
+    rows = [("SHIP-A", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    legacy_id = upload(registered, rows, key="legacy-owner").json()["batch_id"]
+    db_path = registered.app.state.settings.db_path  # type: ignore[attr-defined]
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("DELETE FROM point_sources")
+        conn.execute(
+            "UPDATE ingest_batches SET provenance_version = 0 WHERE id = ?",
+            (legacy_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # New batch only retransmits those observations; it owns no point itself.
+    newer = upload(registered, rows, key="newer-retransmit")
+    assert newer.status_code == 201
+    assert newer.json()["rows_new"] == 0
+    assert newer.json()["rows_duplicate"] == 4
+    newer_id = newer.json()["batch_id"]
+
+    assert revoke(registered, newer_id).status_code == 200
+    # The legacy point and its event remain untouched.
+    assert raw_point_count(registered) == 4
+    assert len(events(registered)) == 1
+
+
+def test_existing_v1_database_is_migrated_and_batches_stay_protected(
+    tmp_path: Path,
+) -> None:
+    """Upgrade a schema-v1 database holding data; provenance stays incomplete."""
+    path = str(tmp_path / "v1.sqlite3")
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE ports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE
+                COLLATE NOCASE, name TEXT NOT NULL, min_lat_e6 INTEGER NOT NULL,
+                max_lat_e6 INTEGER NOT NULL, min_lon_e6 INTEGER NOT NULL,
+                max_lon_e6 INTEGER NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE ingest_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port_id INTEGER NOT NULL, upload_key TEXT NOT NULL,
+                content_sha256 TEXT NOT NULL, rows_received INTEGER NOT NULL,
+                rows_new INTEGER NOT NULL, rows_duplicate INTEGER NOT NULL,
+                rows_outside_port INTEGER NOT NULL, received_at TEXT NOT NULL,
+                UNIQUE (port_id, upload_key));
+            CREATE TABLE raw_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port_id INTEGER NOT NULL, batch_id INTEGER NOT NULL,
+                vessel_id TEXT NOT NULL, event_time INTEGER NOT NULL,
+                lat_e6 INTEGER NOT NULL, lon_e6 INTEGER NOT NULL,
+                UNIQUE (port_id, vessel_id, event_time));
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                port_id INTEGER NOT NULL, vessel_id TEXT NOT NULL,
+                start_time INTEGER NOT NULL, end_time INTEGER NOT NULL,
+                start_lat_e6 INTEGER NOT NULL, start_lon_e6 INTEGER NOT NULL,
+                end_lat_e6 INTEGER NOT NULL, end_lon_e6 INTEGER NOT NULL,
+                point_count INTEGER NOT NULL,
+                created_batch_id INTEGER NOT NULL,
+                updated_batch_id INTEGER NOT NULL);
+            CREATE TABLE event_changes (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL, port_id INTEGER NOT NULL,
+                change_type TEXT NOT NULL, event_id INTEGER NOT NULL,
+                vessel_id TEXT NOT NULL, start_time INTEGER NOT NULL,
+                end_time INTEGER NOT NULL, start_lat_e6 INTEGER,
+                start_lon_e6 INTEGER, end_lat_e6 INTEGER, end_lon_e6 INTEGER,
+                point_count INTEGER, created_at TEXT NOT NULL);
+            CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta VALUES ('version', '1');
+            INSERT INTO ports VALUES (1, 'P', 'legacy', 31000000, 31400000,
+                121200000, 121800000, '2026-01-01T00:00:00+00:00');
+            INSERT INTO ingest_batches VALUES (1, 1, 'old', 'sha', 4, 4, 0, 0,
+                '2026-01-01T00:00:00+00:00');
+            INSERT INTO raw_points VALUES
+                (1,1,1,'SHIP-A',1800000000,31200000,121500000),
+                (2,1,1,'SHIP-A',1800000060,31200000,121500000),
+                (3,1,1,'SHIP-A',1800000120,31200000,121500000),
+                (4,1,1,'SHIP-A',1800000180,31200000,121500000);
+            INSERT INTO events VALUES
+                (1,1,'SHIP-A',1800000000,1800000180,31200000,121500000,
+                 31200000,121500000,4,1,1);
+            """
+        )
+    finally:
+        conn.close()
+
+    db.initialise(path)
+    app = create_app(Settings(db_path=path))
+    with TestClient(app) as client:
+        # Legacy data is still served.
+        assert len(client.get("/ports/P/events").json()["events"]) == 1
+        response = client.post("/ports/P/uploads/1/revoke")
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "batch_provenance_incomplete"
+        # A new upload in the port is revocable and coexists with legacy data.
+        new_rows = [("SHIP-B", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+        upload(client, new_rows, key="post-migration", port="P")
+        new_batch = client.get("/ports/P/events").json()["events"]
+        assert len(new_batch) == 2
+        db_path = path
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            batch = conn.execute(
+                "SELECT * FROM ingest_batches ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            assert batch["provenance_version"] == 1
+        finally:
+            conn.close()
+        assert client.post(
+            f"/ports/P/uploads/{batch['id']}/revoke"
+        ).status_code == 200
+        remaining = client.get("/ports/P/events").json()["events"]
+        assert [e["vessel_id"] for e in remaining] == ["SHIP-A"]
+
+
+def test_revocation_reports_removed_and_retained_point_counts(
+    registered: TestClient,
+) -> None:
+    base = [("SHIP-01", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    base += [("SHIP-02", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)]
+    batch_id = upload(registered, base, key="counts").json()["batch_id"]
+    upload(registered, [("SHIP-02", utc(0, m), *INSIDE) for m in (0, 10, 20, 30)],
+           key="counts-retransmit")
+
+    body = revoke(registered, batch_id).json()
+    assert body["points_removed"] == 4
+    assert body["points_retained"] == 4
+    assert body["event_changes"] == {"upserted": 0, "retracted": 1}
+    assert body["change_cursor"]["from"] is not None
+    # Replay reports exactly the same persisted counts.
+    replay = revoke(registered, batch_id).json()
+    assert replay["points_removed"] == 4
+    assert replay["points_retained"] == 4
+    assert replay["change_cursor"] == body["change_cursor"]

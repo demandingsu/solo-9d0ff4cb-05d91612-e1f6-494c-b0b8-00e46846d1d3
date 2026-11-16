@@ -15,7 +15,7 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ports (
@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS ingest_batches (
     rows_duplicate    INTEGER NOT NULL,
     rows_outside_port INTEGER NOT NULL,
     received_at       TEXT    NOT NULL,
+    -- New batches record one source row per observation.  Rows created by an
+    -- older schema keep 0 and are therefore never revocable: their per-point
+    -- provenance was not recorded, so removal could delete points another
+    -- batch legitimately retransmitted.
+    provenance_version INTEGER NOT NULL DEFAULT 0,
+    revoked_at        TEXT,
+    -- Filled in when the batch is revoked.  Replayed revocations report the
+    -- same counts without touching state.
+    points_removed    INTEGER,
+    points_retained   INTEGER,
     UNIQUE (port_id, upload_key)
 );
 
@@ -61,6 +71,18 @@ CREATE TABLE IF NOT EXISTS raw_points (
 
 CREATE INDEX IF NOT EXISTS idx_raw_points_port_vessel_time
     ON raw_points (port_id, vessel_id, event_time);
+
+-- One row per (observation, upload batch) that asserted it.  A point survives
+-- a revocation while at least one other non-revoked batch also sourced it.
+CREATE TABLE IF NOT EXISTS point_sources (
+    point_id   INTEGER NOT NULL REFERENCES raw_points(id) ON DELETE CASCADE,
+    batch_id   INTEGER NOT NULL REFERENCES ingest_batches(id),
+    created_at TEXT    NOT NULL,
+    PRIMARY KEY (point_id, batch_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_point_sources_batch
+    ON point_sources (batch_id);
 
 CREATE TABLE IF NOT EXISTS events (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,6 +110,11 @@ CREATE INDEX IF NOT EXISTS idx_events_vessel
 CREATE TABLE IF NOT EXISTS event_changes (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id     INTEGER NOT NULL REFERENCES ingest_batches(id),
+    -- Changes with operation='ingest' belong to the original upload, while
+    -- operation='revoke' changes are emitted when that batch is revoked.
+    -- Keeping them apart lets an upload replay report only its own effects.
+    operation    TEXT    NOT NULL DEFAULT 'ingest'
+                 CHECK (operation IN ('ingest', 'revoke')),
     port_id      INTEGER NOT NULL REFERENCES ports(id),
     change_type  TEXT    NOT NULL CHECK (change_type IN ('upsert', 'retract')),
     event_id     INTEGER NOT NULL,
@@ -137,6 +164,42 @@ def connect(db_path: str, *, busy_timeout_ms: int = 30_000) -> sqlite3.Connectio
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database created by schema v1 up to date.
+
+    Existing batches deliberately keep ``provenance_version = 0``: they were
+    written before per-point provenance existed and therefore must not be
+    revoked.  ``CREATE TABLE IF NOT EXISTS`` leaves old tables untouched, so
+    the new columns have to be added explicitly.
+    """
+    batch_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(ingest_batches)")
+    }
+    if "provenance_version" not in batch_columns:
+        conn.execute(
+            "ALTER TABLE ingest_batches ADD COLUMN provenance_version "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    if "revoked_at" not in batch_columns:
+        conn.execute("ALTER TABLE ingest_batches ADD COLUMN revoked_at TEXT")
+    if "points_removed" not in batch_columns:
+        conn.execute(
+            "ALTER TABLE ingest_batches ADD COLUMN points_removed INTEGER"
+        )
+    if "points_retained" not in batch_columns:
+        conn.execute(
+            "ALTER TABLE ingest_batches ADD COLUMN points_retained INTEGER"
+        )
+    change_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(event_changes)")
+    }
+    if "operation" not in change_columns:
+        conn.execute(
+            "ALTER TABLE event_changes ADD COLUMN operation TEXT NOT NULL "
+            "DEFAULT 'ingest' CHECK (operation IN ('ingest', 'revoke'))"
+        )
+
+
 def initialise(db_path: str, *, busy_timeout_ms: int = 30_000) -> None:
     conn = connect(db_path, busy_timeout_ms=busy_timeout_ms)
     try:
@@ -165,6 +228,7 @@ def initialise(db_path: str, *, busy_timeout_ms: int = 30_000) -> None:
         with write_transaction(conn):
             for statement in statements:
                 conn.execute(statement)
+            _migrate(conn)
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
